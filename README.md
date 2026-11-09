@@ -11,6 +11,36 @@ similar to the way that `ssh-agent` or `gpg-agent` work. This allows the client
 to be used in a much simpler way, with the background agent taking care of
 maintaining the necessary state.
 
+## Refresh-token fix branch
+
+The `fix/refresh-token-rotation` branch of
+[oai404iao/rbw](https://github.com/oai404iao/rbw) preserves replacement refresh
+tokens returned by the identity server. Both CLI mutations and agent sync use
+the same database authentication boundary: a per-database sibling file lock,
+fresh credentials loaded under that lock, and an atomic private save before
+retrying a request. A missing replacement leaves the existing refresh token
+unchanged; a failed business retry does not discard a successful refresh.
+Rejected refresh tokens produce an authentication error without logging the
+identity response body or deleting the local vault.
+
+The on-disk database format and CLI remain unchanged. The Rust `actions` API
+now manages stored authentication itself instead of accepting token snapshots
+and returning access-token updates. Database writers must hold `Db::lock` (or
+`lock_async`) across load/modify/save; `save_async` also retains the guard until
+its blocking write finishes, even if its caller is cancelled.
+
+An already expired refresh token still requires one re-authentication; this
+fix cannot renew an expired session. Plan switching packages and restarting
+the agent together: older agents do not participate in the new lock protocol.
+Installing a new binary alone does not update an already running agent.
+
+Regression tests use isolated XDG directories and a loopback mock identity
+server with fictitious tokens:
+
+```sh
+cargo test --locked --all-features --test refresh_rotation
+```
+
 ## Maintenance
 
 I consider `rbw` to be essentially feature-complete for me at this point. While

@@ -369,9 +369,21 @@ struct ConnectRefreshTokenReq {
     refresh_token: String,
 }
 
-#[derive(serde::Deserialize, Debug)]
-struct ConnectRefreshTokenRes {
-    access_token: String,
+#[derive(serde::Deserialize)]
+pub struct RefreshedTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+impl RefreshedTokens {
+    fn validate(self) -> Result<Self> {
+        if self.access_token.is_empty()
+            || self.refresh_token.as_ref().is_some_and(String::is_empty)
+        {
+            return Err(Error::InvalidRefreshResponse);
+        }
+        Ok(self)
+    }
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -1545,7 +1557,7 @@ impl Client {
     pub fn exchange_refresh_token(
         &self,
         refresh_token: &str,
-    ) -> Result<String> {
+    ) -> Result<RefreshedTokens> {
         let connect_req = ConnectRefreshTokenReq {
             grant_type: "refresh_token".to_string(),
             client_id: "cli".to_string(),
@@ -1557,14 +1569,30 @@ impl Client {
             .form(&connect_req)
             .send()
             .map_err(|source| Error::Reqwest { source })?;
-        let connect_res: ConnectRefreshTokenRes = res.json_with_path()?;
-        Ok(connect_res.access_token)
+        let status = res.status();
+        if status != reqwest::StatusCode::OK {
+            let rejected = status == reqwest::StatusCode::BAD_REQUEST
+                && res.json::<serde_json::Value>().ok().is_some_and(|v| {
+                    v.get("error").and_then(serde_json::Value::as_str)
+                        == Some("invalid_grant")
+                });
+            return Err(if rejected {
+                Error::RefreshTokenRejected
+            } else {
+                Error::RequestFailed {
+                    status: status.as_u16(),
+                }
+            });
+        }
+        res.json::<RefreshedTokens>()
+            .map_err(|_| Error::InvalidRefreshResponse)?
+            .validate()
     }
 
     pub async fn exchange_refresh_token_async(
         &self,
         refresh_token: &str,
-    ) -> Result<String> {
+    ) -> Result<RefreshedTokens> {
         let connect_req = ConnectRefreshTokenReq {
             grant_type: "refresh_token".to_string(),
             client_id: "cli".to_string(),
@@ -1577,9 +1605,27 @@ impl Client {
             .send()
             .await
             .map_err(|source| Error::Reqwest { source })?;
-        let connect_res: ConnectRefreshTokenRes =
-            res.json_with_path().await?;
-        Ok(connect_res.access_token)
+        let status = res.status();
+        if status != reqwest::StatusCode::OK {
+            let rejected = status == reqwest::StatusCode::BAD_REQUEST
+                && res.json::<serde_json::Value>().await.ok().is_some_and(
+                    |v| {
+                        v.get("error").and_then(serde_json::Value::as_str)
+                            == Some("invalid_grant")
+                    },
+                );
+            return Err(if rejected {
+                Error::RefreshTokenRejected
+            } else {
+                Error::RequestFailed {
+                    status: status.as_u16(),
+                }
+            });
+        }
+        res.json::<RefreshedTokens>()
+            .await
+            .map_err(|_| Error::InvalidRefreshResponse)?
+            .validate()
     }
 
     fn api_url(&self, path: &str) -> String {

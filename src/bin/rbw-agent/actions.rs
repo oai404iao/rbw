@@ -326,9 +326,11 @@ async fn login_success(
     parallelism: Option<u32>,
     protected_key: String,
     password: rbw::locked::Password,
-    mut db: rbw::db::Db,
+    db: rbw::db::Db,
     email: String,
 ) -> anyhow::Result<()> {
+    let db_guard = lock_db().await?;
+    let mut db = load_db().await.unwrap_or(db);
     db.access_token = Some(access_token.clone());
     db.refresh_token = Some(refresh_token.clone());
     db.kdf = Some(kdf);
@@ -336,7 +338,8 @@ async fn login_success(
     db.memory = memory;
     db.parallelism = parallelism;
     db.protected_key = Some(protected_key.clone());
-    save_db(&db).await?;
+    save_db(&db, &db_guard).await?;
+    drop(db_guard);
 
     sync(None, state.clone()).await?;
     let db = load_db().await?;
@@ -509,33 +512,21 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
+    let (protected_key, protected_private_key, protected_org_keys, entries) =
+        rbw::actions::sync()
+            .await
+            .context("failed to sync database from server")?;
+    let db_guard = lock_db().await?;
+    // Authentication may have advanced in another process since the request.
+    // Only replace vault contents, never restore credentials from a snapshot.
     let mut db = load_db().await?;
-
-    let access_token = if let Some(access_token) = &db.access_token {
-        access_token.clone()
-    } else {
-        return Err(anyhow::anyhow!("failed to find access token in db"));
-    };
-    let refresh_token = if let Some(refresh_token) = &db.refresh_token {
-        refresh_token.clone()
-    } else {
-        return Err(anyhow::anyhow!("failed to find refresh token in db"));
-    };
-    let (
-        access_token,
-        (protected_key, protected_private_key, protected_org_keys, entries),
-    ) = rbw::actions::sync(&access_token, &refresh_token)
-        .await
-        .context("failed to sync database from server")?;
     state.lock().await.set_master_password_reprompt(&entries);
-    if let Some(access_token) = access_token {
-        db.access_token = Some(access_token);
-    }
     db.protected_key = Some(protected_key);
     db.protected_private_key = Some(protected_private_key);
     db.protected_org_keys = protected_org_keys;
     db.entries = entries;
-    save_db(&db).await?;
+    save_db(&db, &db_guard).await?;
+    drop(db_guard);
 
     if let Err(e) = subscribe_to_notifications(state.clone()).await {
         eprintln!("failed to subscribe to notifications: {e}");
@@ -797,10 +788,19 @@ async fn load_db() -> anyhow::Result<rbw::db::Db> {
     }
 }
 
-async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
+async fn lock_db() -> anyhow::Result<std::fs::File> {
+    let config = rbw::config::Config::load_async().await?;
+    let email = config.email.as_deref().context("email address not set")?;
+    Ok(rbw::db::Db::lock_async(&config.server_name(), email).await?)
+}
+
+async fn save_db(
+    db: &rbw::db::Db,
+    guard: &std::fs::File,
+) -> anyhow::Result<()> {
     let config = rbw::config::Config::load_async().await?;
     if let Some(email) = &config.email {
-        db.save_async(&config.server_name(), email)
+        db.save_async(&config.server_name(), email, guard)
             .await
             .map_err(anyhow::Error::new)
     } else {

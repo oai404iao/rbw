@@ -3,6 +3,15 @@ pub enum Error {
     #[error("email address not set")]
     ConfigMissingEmail,
 
+    #[error("not logged in; authenticate with rbw login")]
+    NotLoggedIn,
+
+    #[error("refresh token rejected; re-authentication is required")]
+    RefreshTokenRejected,
+
+    #[error("invalid token refresh response")]
+    InvalidRefreshResponse,
+
     #[error("failed to create block mode decryptor")]
     CreateBlockMode { source: aes::cipher::InvalidLength },
 

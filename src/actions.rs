@@ -133,26 +133,16 @@ pub fn unlock<S: std::hash::BuildHasher>(
     Ok((key, org_keys))
 }
 
-pub async fn sync(
-    access_token: &str,
-    refresh_token: &str,
-) -> Result<(
-    Option<String>,
-    (
-        String,
-        String,
-        std::collections::HashMap<String, String>,
-        Vec<crate::db::Entry>,
-    ),
+pub async fn sync() -> Result<(
+    String,
+    String,
+    std::collections::HashMap<String, String>,
+    Vec<crate::db::Entry>,
 )> {
-    with_exchange_refresh_token_async(
-        access_token,
-        refresh_token,
-        |access_token| {
-            let access_token = access_token.to_string();
-            Box::pin(async move { sync_once(&access_token).await })
-        },
-    )
+    with_exchange_refresh_token_async(|access_token| {
+        let access_token = access_token.to_string();
+        Box::pin(async move { sync_once(&access_token).await })
+    })
     .await
 }
 
@@ -169,14 +159,12 @@ async fn sync_once(
 }
 
 pub fn add(
-    access_token: &str,
-    refresh_token: &str,
     name: &str,
     data: &crate::db::EntryData,
     notes: Option<&str>,
     folder_id: Option<&str>,
-) -> Result<(Option<String>, ())> {
-    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+) -> Result<()> {
+    with_exchange_refresh_token(|access_token| {
         add_once(access_token, name, data, notes, folder_id)
     })
 }
@@ -194,8 +182,6 @@ fn add_once(
 }
 
 pub fn edit(
-    access_token: &str,
-    refresh_token: &str,
     id: &str,
     org_id: Option<&str>,
     name: &str,
@@ -204,8 +190,8 @@ pub fn edit(
     notes: Option<&str>,
     folder_uuid: Option<&str>,
     history: &[crate::db::HistoryEntry],
-) -> Result<(Option<String>, ())> {
-    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+) -> Result<()> {
+    with_exchange_refresh_token(|access_token| {
         edit_once(
             access_token,
             id,
@@ -246,14 +232,8 @@ fn edit_once(
     Ok(())
 }
 
-pub fn remove(
-    access_token: &str,
-    refresh_token: &str,
-    id: &str,
-) -> Result<(Option<String>, ())> {
-    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
-        remove_once(access_token, id)
-    })
+pub fn remove(id: &str) -> Result<()> {
+    with_exchange_refresh_token(|access_token| remove_once(access_token, id))
 }
 
 fn remove_once(access_token: &str, id: &str) -> Result<()> {
@@ -262,11 +242,8 @@ fn remove_once(access_token: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_folders(
-    access_token: &str,
-    refresh_token: &str,
-) -> Result<(Option<String>, Vec<(String, String)>)> {
-    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+pub fn list_folders() -> Result<Vec<(String, String)>> {
+    with_exchange_refresh_token(|access_token| {
         list_folders_once(access_token)
     })
 }
@@ -276,12 +253,8 @@ fn list_folders_once(access_token: &str) -> Result<Vec<(String, String)>> {
     client.folders(access_token)
 }
 
-pub fn create_folder(
-    access_token: &str,
-    refresh_token: &str,
-    name: &str,
-) -> Result<(Option<String>, String)> {
-    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+pub fn create_folder(name: &str) -> Result<String> {
+    with_exchange_refresh_token(|access_token| {
         create_folder_once(access_token, name)
     })
 }
@@ -291,30 +264,37 @@ fn create_folder_once(access_token: &str, name: &str) -> Result<String> {
     client.create_folder(access_token, name)
 }
 
-fn with_exchange_refresh_token<F, T>(
-    access_token: &str,
-    refresh_token: &str,
-    f: F,
-) -> Result<(Option<String>, T)>
+// The database lock covers loading credentials, refreshing, saving, and retrying.
+// Persist a rotated refresh token before retrying the business request: the
+// server may already have invalidated its predecessor even if that retry fails.
+fn with_exchange_refresh_token<F, T>(f: F) -> Result<T>
 where
     F: Fn(&str) -> Result<T>,
 {
+    let (client, config) = api_client()?;
+    let email = config.email.as_deref().ok_or(Error::ConfigMissingEmail)?;
+    let server = config.server_name();
+    let _guard = crate::db::Db::lock(&server, email)?;
+    let mut db = crate::db::Db::load(&server, email)?;
+    let access_token =
+        db.access_token.as_deref().ok_or(Error::NotLoggedIn)?;
     match f(access_token) {
-        Ok(t) => Ok((None, t)),
         Err(Error::RequestUnauthorized) => {
-            let access_token = exchange_refresh_token(refresh_token)?;
-            let t = f(&access_token)?;
-            Ok((Some(access_token), t))
+            let tokens = client.exchange_refresh_token(
+                db.refresh_token.as_deref().ok_or(Error::NotLoggedIn)?,
+            )?;
+            db.access_token = Some(tokens.access_token);
+            if let Some(refresh_token) = tokens.refresh_token {
+                db.refresh_token = Some(refresh_token);
+            }
+            db.save(&server, email)?;
+            f(db.access_token.as_deref().ok_or(Error::NotLoggedIn)?)
         }
-        Err(e) => Err(e),
+        result => result,
     }
 }
 
-async fn with_exchange_refresh_token_async<F, T>(
-    access_token: &str,
-    refresh_token: &str,
-    f: F,
-) -> Result<(Option<String>, T)>
+async fn with_exchange_refresh_token_async<F, T>(f: F) -> Result<T>
 where
     F: Fn(
             &str,
@@ -324,26 +304,29 @@ where
         + Sync,
     T: Send,
 {
+    let (client, config) = api_client_async().await?;
+    let email = config.email.as_deref().ok_or(Error::ConfigMissingEmail)?;
+    let server = config.server_name();
+    let guard = crate::db::Db::lock_async(&server, email).await?;
+    let mut db = crate::db::Db::load_async(&server, email).await?;
+    let access_token =
+        db.access_token.as_deref().ok_or(Error::NotLoggedIn)?;
     match f(access_token).await {
-        Ok(t) => Ok((None, t)),
         Err(Error::RequestUnauthorized) => {
-            let access_token =
-                exchange_refresh_token_async(refresh_token).await?;
-            let t = f(&access_token).await?;
-            Ok((Some(access_token), t))
+            let tokens = client
+                .exchange_refresh_token_async(
+                    db.refresh_token.as_deref().ok_or(Error::NotLoggedIn)?,
+                )
+                .await?;
+            db.access_token = Some(tokens.access_token);
+            if let Some(refresh_token) = tokens.refresh_token {
+                db.refresh_token = Some(refresh_token);
+            }
+            db.save_async(&server, email, &guard).await?;
+            f(db.access_token.as_deref().ok_or(Error::NotLoggedIn)?).await
         }
-        Err(e) => Err(e),
+        result => result,
     }
-}
-
-fn exchange_refresh_token(refresh_token: &str) -> Result<String> {
-    let (client, _) = api_client()?;
-    client.exchange_refresh_token(refresh_token)
-}
-
-async fn exchange_refresh_token_async(refresh_token: &str) -> Result<String> {
-    let (client, _) = api_client()?;
-    client.exchange_refresh_token_async(refresh_token).await
 }
 
 fn api_client() -> Result<(crate::api::Client, crate::config::Config)> {

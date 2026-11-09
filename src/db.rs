@@ -1,8 +1,9 @@
 use crate::prelude::*;
 
 use std::io::{Read as _, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncReadExt as _;
 
 #[derive(
     serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
@@ -196,6 +197,29 @@ impl Db {
         Self::default()
     }
 
+    /// Hold this guard across loading, modifying, and saving the database.
+    /// The sibling lock file must remain in place when the database is replaced
+    /// or removed, so every process locks the same inode.
+    pub fn lock(server: &str, email: &str) -> Result<std::fs::File> {
+        let file = crate::dirs::db_file(server, email);
+        lock_file(&file).map_err(|source| Error::SaveDb { source, file })
+    }
+
+    pub async fn lock_async(
+        server: &str,
+        email: &str,
+    ) -> Result<std::fs::File> {
+        let file = crate::dirs::db_file(server, email);
+        let path = file.clone();
+        tokio::task::spawn_blocking(move || lock_file(&path))
+            .await
+            .map_err(|source| Error::SaveDb {
+                source: std::io::Error::other(source),
+                file: file.clone(),
+            })?
+            .map_err(|source| Error::SaveDb { source, file })
+    }
+
     pub fn load(server: &str, email: &str) -> Result<Self> {
         let file = crate::dirs::db_file(server, email);
         let mut fh =
@@ -235,66 +259,51 @@ impl Db {
         Ok(slf)
     }
 
-    // XXX need to make this atomic
     pub fn save(&self, server: &str, email: &str) -> Result<()> {
         let file = crate::dirs::db_file(server, email);
-        // unwrap is safe here because Self::filename is explicitly
-        // constructed as a filename in a directory
-        std::fs::create_dir_all(file.parent().unwrap()).map_err(
-            |source| Error::SaveDb {
-                source,
-                file: file.clone(),
-            },
-        )?;
-        let mut fh =
-            std::fs::File::create(&file).map_err(|source| Error::SaveDb {
+        let json =
+            serde_json::to_vec(self).map_err(|source| Error::SaveDbJson {
                 source,
                 file: file.clone(),
             })?;
-        fh.write_all(
-            serde_json::to_string(self)
-                .map_err(|source| Error::SaveDbJson {
-                    source,
-                    file: file.clone(),
-                })?
-                .as_bytes(),
-        )
-        .map_err(|source| Error::SaveDb { source, file })?;
-        Ok(())
+        save_bytes(&file, &json)
+            .map_err(|source| Error::SaveDb { source, file })
     }
 
-    // XXX need to make this atomic
-    pub async fn save_async(&self, server: &str, email: &str) -> Result<()> {
+    pub async fn save_async(
+        &self,
+        server: &str,
+        email: &str,
+        guard: &std::fs::File,
+    ) -> Result<()> {
         let file = crate::dirs::db_file(server, email);
-        // unwrap is safe here because Self::filename is explicitly
-        // constructed as a filename in a directory
-        tokio::fs::create_dir_all(file.parent().unwrap())
-            .await
-            .map_err(|source| Error::SaveDbAsync {
+        let json =
+            serde_json::to_vec(self).map_err(|source| Error::SaveDbJson {
                 source,
                 file: file.clone(),
             })?;
-        let mut fh =
-            tokio::fs::File::create(&file).await.map_err(|source| {
-                Error::SaveDbAsync {
-                    source,
-                    file: file.clone(),
-                }
+        let path = file.clone();
+        // A cancelled async caller must not release the transaction lock while
+        // its blocking write is still in flight.
+        let guard =
+            guard.try_clone().map_err(|source| Error::SaveDbAsync {
+                source,
+                file: file.clone(),
             })?;
-        fh.write_all(
-            serde_json::to_string(self)
-                .map_err(|source| Error::SaveDbJson {
-                    source,
-                    file: file.clone(),
-                })?
-                .as_bytes(),
-        )
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            save_bytes(&path, &json)
+        })
         .await
-        .map_err(|source| Error::SaveDbAsync { source, file })?;
-        Ok(())
+        .map_err(|source| Error::SaveDbAsync {
+            source: std::io::Error::other(source),
+            file: file.clone(),
+        })?
+        .map_err(|source| Error::SaveDbAsync { source, file })
     }
 
     pub fn remove(server: &str, email: &str) -> Result<()> {
+        let _guard = Self::lock(server, email)?;
         let file = crate::dirs::db_file(server, email);
         let res = std::fs::remove_file(&file);
         if let Err(e) = &res {
@@ -312,5 +321,107 @@ impl Db {
             || self.iterations.is_none()
             || self.kdf.is_none()
             || self.protected_key.is_none()
+    }
+}
+
+fn lock_file(file: &std::path::Path) -> std::io::Result<std::fs::File> {
+    // Database paths always include their containing directory.
+    std::fs::create_dir_all(file.parent().unwrap())?;
+    let mut lock_path = file.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock_path)?;
+    rustix::fs::flock(&guard, rustix::fs::FlockOperation::LockExclusive)?;
+    Ok(guard)
+}
+
+fn save_bytes(file: &std::path::Path, json: &[u8]) -> std::io::Result<()> {
+    // Database paths always include their containing directory.
+    let directory = file.parent().unwrap();
+    std::fs::create_dir_all(directory)?;
+    // NamedTempFile creates the file with mode 0600 on Unix.
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(json)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(file).map_err(|error| error.error)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn atomic_save_keeps_existing_readers_and_private_permissions() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("db.json");
+        save_bytes(&file, b"old").unwrap();
+        let mut reader = std::fs::File::open(&file).unwrap();
+        save_bytes(&file, b"new").unwrap();
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "old");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600,
+        );
+    }
+
+    #[test]
+    fn failed_save_leaves_destination_unchanged_and_cleans_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("db.json");
+        std::fs::create_dir(&file).unwrap();
+        assert!(save_bytes(&file, b"new").is_err());
+        assert!(file.is_dir());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn lock_survives_database_replacement_and_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("db.json");
+        let guard = lock_file(&file).unwrap();
+        save_bytes(&file, b"old").unwrap();
+        save_bytes(&file, b"new").unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let lock_path = directory.path().join("db.json.lock");
+        let contender = std::fs::File::open(&lock_path).unwrap();
+        assert_eq!(
+            std::fs::metadata(lock_path).unwrap().permissions().mode()
+                & 0o777,
+            0o600,
+        );
+        assert_eq!(
+            rustix::fs::flock(
+                &contender,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ),
+            Err(rustix::io::Errno::WOULDBLOCK),
+        );
+        let retained_guard = guard.try_clone().unwrap();
+        drop(guard);
+        assert_eq!(
+            rustix::fs::flock(
+                &contender,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive,
+            ),
+            Err(rustix::io::Errno::WOULDBLOCK),
+        );
+        drop(retained_guard);
+        rustix::fs::flock(
+            &contender,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
     }
 }

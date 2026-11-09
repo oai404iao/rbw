@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+* Persist replacement refresh tokens before retrying authenticated requests,
+  including when the retried request fails. Keep the previous refresh token
+  when the server does not issue a replacement.
+* Serialize authentication and database writes across processes, atomically
+  replace private database files, and prevent sync from restoring stale tokens.
+* Report rejected or malformed refresh responses without exposing their body.
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
