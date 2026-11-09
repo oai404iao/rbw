@@ -32,6 +32,10 @@ async fn tokio_main(
     let notifications_handler = crate::notifications::Handler::new();
     let state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::state::State {
+            reauthentication: std::sync::Arc::new(
+                tokio::sync::Mutex::new(()),
+            ),
+            sync_update: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             priv_key: None,
             org_keys: None,
             timeout,

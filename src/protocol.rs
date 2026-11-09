@@ -12,9 +12,12 @@ pub const VERSION: u32 = {
     let minor = env!("CARGO_PKG_VERSION_MINOR");
     let patch = env!("CARGO_PKG_VERSION_PATCH");
 
+    // The fork adds an explicitly interactive sync action. Older agents must
+    // be switched manually rather than silently accepting a weaker workflow.
     unwrap(&u32::from_str_radix(major, 10)) * 1_000_000
         + unwrap(&u32::from_str_radix(minor, 10)) * 1_000_000
         + unwrap(&u32::from_str_radix(patch, 10)) * 1_000_000
+        + 1
 };
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -174,6 +177,7 @@ pub enum Action {
     CheckLock,
     Lock,
     Sync,
+    SyncInteractive,
     Decrypt {
         cipherstring: String,
         entry_key: Option<String>,

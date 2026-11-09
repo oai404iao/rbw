@@ -83,145 +83,136 @@ pub async fn login(
     let db = load_db().await.unwrap_or_else(|_| rbw::db::Db::new());
 
     if db.needs_login() {
-        let url_str = config_base_url().await?;
-        let url = reqwest::Url::parse(&url_str)
-            .context("failed to parse base url")?;
-        let Some(host) = url.host_str() else {
-            return Err(anyhow::anyhow!(
-                "couldn't find host in rbw base url {url_str}"
-            ));
-        };
-
         let email = config_email().await?;
-
-        let mut err_msg = None;
-        'attempts: for i in 1_u8..=3 {
-            let err = if i > 1 {
-                // this unwrap is safe because we only ever continue the loop
-                // if we have set err_msg
-                Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-            } else {
-                None
-            };
-            let password = rbw::pinentry::getpin(
-                &config_pinentry().await?,
-                "Master Password",
-                &format!("Log in to {host}"),
-                err.as_deref(),
-                environment,
-                true,
-            )
-            .await
-            .context("failed to read password from pinentry")?;
-            match rbw::actions::login(&email, password.clone(), None, None)
-                .await
-            {
-                Ok((
-                    access_token,
-                    refresh_token,
-                    kdf,
-                    iterations,
-                    memory,
-                    parallelism,
-                    protected_key,
-                )) => {
-                    login_success(
-                        state.clone(),
-                        access_token,
-                        refresh_token,
-                        kdf,
-                        iterations,
-                        memory,
-                        parallelism,
-                        protected_key,
-                        password,
-                        db,
-                        email,
-                    )
-                    .await?;
-                    break 'attempts;
-                }
-                Err(rbw::error::Error::TwoFactorRequired {
-                    providers,
-                    sso_email_2fa_session_token,
-                }) => {
-                    let supported_types = vec![
-                        rbw::api::TwoFactorProviderType::Authenticator,
-                        rbw::api::TwoFactorProviderType::Yubikey,
-                        rbw::api::TwoFactorProviderType::Email,
-                    ];
-
-                    for provider in supported_types {
-                        if providers.contains(&provider) {
-                            if provider
-                                == rbw::api::TwoFactorProviderType::Email
-                            {
-                                if let Some(sso_email_2fa_session_token) =
-                                    sso_email_2fa_session_token
-                                {
-                                    rbw::actions::send_two_factor_email(
-                                        &email,
-                                        &sso_email_2fa_session_token,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            let (
-                                access_token,
-                                refresh_token,
-                                kdf,
-                                iterations,
-                                memory,
-                                parallelism,
-                                protected_key,
-                            ) = two_factor(
-                                environment,
-                                &email,
-                                password.clone(),
-                                provider,
-                            )
-                            .await?;
-                            login_success(
-                                state.clone(),
-                                access_token,
-                                refresh_token,
-                                kdf,
-                                iterations,
-                                memory,
-                                parallelism,
-                                protected_key,
-                                password,
-                                db,
-                                email,
-                            )
-                            .await?;
-                            break 'attempts;
-                        }
-                    }
-                    return Err(anyhow::anyhow!(
-                        "unsupported two factor methods: {providers:?}"
-                    ));
-                }
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    if i == 3 {
-                        return Err(rbw::error::Error::IncorrectPassword {
-                            message,
-                        })
-                        .context("failed to log in to bitwarden instance");
-                    }
-                    err_msg = Some(message);
-                }
-                Err(e) => {
-                    return Err(e)
-                        .context("failed to log in to bitwarden instance")
-                }
-            }
-        }
+        let (tokens, password) = authenticate(&email, environment).await?;
+        let (
+            access_token,
+            refresh_token,
+            kdf,
+            iterations,
+            memory,
+            parallelism,
+            protected_key,
+        ) = tokens;
+        login_success(
+            state,
+            access_token,
+            refresh_token,
+            kdf,
+            iterations,
+            memory,
+            parallelism,
+            protected_key,
+            password,
+            db,
+            email,
+        )
+        .await?;
     }
 
     respond_ack(sock).await?;
 
     Ok(())
+}
+
+type LoginTokens = (
+    String,
+    String,
+    rbw::api::KdfType,
+    u32,
+    Option<u32>,
+    Option<u32>,
+    String,
+);
+
+async fn authenticate(
+    email: &str,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<(LoginTokens, rbw::locked::Password)> {
+    let url_str = config_base_url().await?;
+    let url =
+        reqwest::Url::parse(&url_str).context("failed to parse base url")?;
+    let Some(host) = url.host_str() else {
+        return Err(anyhow::anyhow!(
+            "couldn't find host in rbw base url {url_str}"
+        ));
+    };
+
+    let mut err_msg = None;
+    for i in 1_u8..=3 {
+        let err = if i > 1 {
+            // this unwrap is safe because we only ever continue the loop
+            // if we have set err_msg
+            Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
+        } else {
+            None
+        };
+        let password = rbw::pinentry::getpin(
+            &config_pinentry().await?,
+            "Master Password",
+            &format!("Log in to {host}"),
+            err.as_deref(),
+            environment,
+            true,
+        )
+        .await
+        .context("failed to read password from pinentry")?;
+        match rbw::actions::login(email, password.clone(), None, None).await {
+            Ok(tokens) => return Ok((tokens, password)),
+            Err(rbw::error::Error::TwoFactorRequired {
+                providers,
+                sso_email_2fa_session_token,
+            }) => {
+                let supported_types = vec![
+                    rbw::api::TwoFactorProviderType::Authenticator,
+                    rbw::api::TwoFactorProviderType::Yubikey,
+                    rbw::api::TwoFactorProviderType::Email,
+                ];
+
+                for provider in supported_types {
+                    if providers.contains(&provider) {
+                        if provider == rbw::api::TwoFactorProviderType::Email
+                        {
+                            if let Some(sso_email_2fa_session_token) =
+                                sso_email_2fa_session_token
+                            {
+                                rbw::actions::send_two_factor_email(
+                                    email,
+                                    &sso_email_2fa_session_token,
+                                )
+                                .await?;
+                            }
+                        }
+                        let tokens = two_factor(
+                            environment,
+                            email,
+                            password.clone(),
+                            provider,
+                        )
+                        .await?;
+                        return Ok((tokens, password));
+                    }
+                }
+                return Err(anyhow::anyhow!(
+                    "unsupported two factor methods: {providers:?}"
+                ));
+            }
+            Err(rbw::error::Error::IncorrectPassword { message }) => {
+                if i == 3 {
+                    return Err(rbw::error::Error::IncorrectPassword {
+                        message,
+                    })
+                    .context("failed to log in to bitwarden instance");
+                }
+                err_msg = Some(message);
+            }
+            Err(e) => {
+                return Err(e)
+                    .context("failed to log in to bitwarden instance")
+            }
+        }
+    }
+    unreachable!()
 }
 
 async fn two_factor(
@@ -512,6 +503,8 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
+    let sync_update = state.lock().await.sync_update.clone();
+    let sync_update_guard = sync_update.lock().await;
     let (protected_key, protected_private_key, protected_org_keys, entries) =
         rbw::actions::sync()
             .await
@@ -527,6 +520,7 @@ pub async fn sync(
     db.entries = entries;
     save_db(&db, &db_guard).await?;
     drop(db_guard);
+    drop(sync_update_guard);
 
     if let Err(e) = subscribe_to_notifications(state.clone()).await {
         eprintln!("failed to subscribe to notifications: {e}");
@@ -536,6 +530,325 @@ pub async fn sync(
         respond_ack(sock).await?;
     }
 
+    Ok(())
+}
+
+pub async fn sync_interactive(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+) -> anyhow::Result<()> {
+    let reauthentication = state.lock().await.reauthentication.clone();
+    let _reauthentication =
+        reauthentication.try_lock_owned().map_err(|_| {
+            anyhow::anyhow!("reauthentication already in progress")
+        })?;
+
+    let config = rbw::config::Config::load_async().await?;
+    let email = config.email.as_deref().context("email address not set")?;
+    let server = config.server_name();
+    // Snapshot before any prompting, including the initial refresh attempt.
+    // Never hold the cross-process lock while waiting for user input.
+    let guard = rbw::db::Db::lock_async(&server, email).await?;
+    let snapshot =
+        serde_json::to_value(rbw::db::Db::load_async(&server, email).await?)?;
+    drop(guard);
+
+    match sync(None, state.clone()).await {
+        Ok(()) => return respond_ack(sock).await,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<rbw::error::Error>(),
+                Some(rbw::error::Error::RefreshTokenRejected)
+            ) => {}
+        Err(error) => return Err(error),
+    }
+
+    let prepare_commit = async {
+        rbw::pinentry::confirm(
+        &config.pinentry,
+        "The server rejected the saved login. Reauthenticate and replace the local login and vault only after successful validation?",
+        environment,
+    )
+    .await
+    .context("reauthentication was not confirmed")?;
+
+        let (tokens, password) = authenticate(email, environment).await?;
+        let (
+            access_token,
+            refresh_token,
+            kdf,
+            iterations,
+            memory,
+            parallelism,
+            _,
+        ) = tokens;
+        let client = rbw::api::Client::new(
+            &config.base_url(),
+            &config.identity_url(),
+            &config.ui_url(),
+            config.client_cert_path(),
+        );
+        let (
+            protected_key,
+            protected_private_key,
+            protected_org_keys,
+            entries,
+        ) = client
+            .sync(&access_token)
+            .await
+            .context("failed to sync reauthenticated vault")?;
+        // The sync profile, rather than the earlier identity response, supplies
+        // the protected key that must match the candidate vault.
+        let (keys, org_keys) = rbw::actions::unlock(
+            email,
+            &password,
+            kdf,
+            iterations,
+            memory,
+            parallelism,
+            &protected_key,
+            &protected_private_key,
+            &protected_org_keys,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("failed to unlock reauthenticated vault")
+        })?;
+        validate_candidate(
+            &keys,
+            &org_keys,
+            &protected_private_key,
+            &entries,
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("failed to validate reauthenticated vault")
+        })?;
+
+        let candidate = rbw::db::Db {
+            access_token: Some(access_token),
+            refresh_token: Some(refresh_token),
+            kdf: Some(kdf),
+            iterations: Some(iterations),
+            memory,
+            parallelism,
+            protected_key: Some(protected_key),
+            protected_private_key: Some(protected_private_key),
+            protected_org_keys,
+            entries,
+        };
+        let sync_update = state.lock().await.sync_update.clone();
+        let sync_update_guard = sync_update.lock_owned().await;
+        let guard = rbw::db::Db::lock_async(&server, email).await?;
+        let current = rbw::db::Db::load_async(&server, email).await?;
+        if serde_json::to_value(current)? != snapshot {
+            anyhow::bail!("local database changed during reauthentication; retry sync --reauth");
+        }
+        let locked_state = state.clone().lock_owned().await;
+        Ok::<_, anyhow::Error>((
+            candidate,
+            keys,
+            org_keys,
+            sync_update_guard,
+            guard,
+            locked_state,
+        ))
+    };
+    let (
+        candidate,
+        keys,
+        org_keys,
+        sync_update_guard,
+        guard,
+        mut locked_state,
+    ) = tokio::select! {
+        biased;
+        _ = sock.disconnected() => anyhow::bail!("reauthentication cancelled: client disconnected"),
+        result = prepare_commit => result?,
+    };
+    // Once replacement starts, finish installing matching in-memory keys even
+    // if the client disconnects or persistence reports uncertain durability.
+    let durability_error = match candidate
+        .save_async(&server, email, &guard)
+        .await
+    {
+        Ok(()) => None,
+        Err(error @ rbw::error::Error::SaveDbCommitted { .. }) => Some(error),
+        Err(error) => return Err(error.into()),
+    };
+    locked_state.priv_key = Some(keys);
+    locked_state.org_keys = Some(org_keys);
+    locked_state.set_master_password_reprompt(&candidate.entries);
+    locked_state.set_timeout();
+    drop(locked_state);
+    drop(guard);
+    drop(sync_update_guard);
+
+    if let Some(error) = durability_error {
+        return Err(error).context(
+            "reauthentication committed, but cache durability is uncertain",
+        );
+    }
+
+    if let Err(error) = subscribe_to_notifications(state).await {
+        eprintln!("failed to subscribe to notifications: {error}");
+    }
+    respond_ack(sock).await
+}
+
+fn validate_candidate(
+    account_keys: &rbw::locked::Keys,
+    org_keys: &std::collections::HashMap<String, rbw::locked::Keys>,
+    protected_private_key: &str,
+    entries: &[rbw::db::Entry],
+) -> anyhow::Result<()> {
+    use pkcs8::DecodePrivateKey as _;
+    use zeroize::Zeroize as _;
+
+    let mut private_key =
+        rbw::cipherstring::CipherString::new(protected_private_key)?
+            .decrypt_symmetric(account_keys, None)?;
+    let parsed = rsa::RsaPrivateKey::from_pkcs8_der(&private_key);
+    private_key.zeroize();
+    parsed.context("invalid private key")?;
+
+    for entry in entries {
+        let keys = match entry.org_id.as_deref() {
+            Some(id) => {
+                org_keys.get(id).context("missing organization key")?
+            }
+            None => account_keys,
+        };
+        let entry_key = entry
+            .key
+            .as_deref()
+            .map(|encrypted| {
+                let key = rbw::cipherstring::CipherString::new(encrypted)?
+                    .decrypt_locked_symmetric(keys)?;
+                anyhow::ensure!(
+                    key.data().len() >= 64,
+                    "invalid item key length"
+                );
+                Ok::<_, anyhow::Error>(rbw::locked::Keys::new(key))
+            })
+            .transpose()?;
+        let decrypt = |encrypted: Option<&str>| -> anyhow::Result<()> {
+            if let Some(encrypted) =
+                encrypted.filter(|value| !value.is_empty())
+            {
+                let mut plaintext =
+                    rbw::cipherstring::CipherString::new(encrypted)?
+                        .decrypt_symmetric(keys, entry_key.as_ref())?;
+                let valid_utf8 = std::str::from_utf8(&plaintext).is_ok();
+                plaintext.zeroize();
+                anyhow::ensure!(valid_utf8, "invalid decrypted text");
+            }
+            Ok(())
+        };
+        decrypt(Some(&entry.name))?;
+        // Folders use the account key, not organization or individual keys.
+        if let Some(folder) =
+            entry.folder.as_deref().filter(|value| !value.is_empty())
+        {
+            let mut plaintext = rbw::cipherstring::CipherString::new(folder)?
+                .decrypt_symmetric(account_keys, None)?;
+            let valid_utf8 = std::str::from_utf8(&plaintext).is_ok();
+            plaintext.zeroize();
+            anyhow::ensure!(valid_utf8, "invalid decrypted folder text");
+        }
+        decrypt(entry.notes.as_deref())?;
+        for field in &entry.fields {
+            decrypt(field.name.as_deref())?;
+            decrypt(field.value.as_deref())?;
+        }
+        for history in &entry.history {
+            decrypt(Some(&history.password))?;
+        }
+        match &entry.data {
+            rbw::db::EntryData::Login {
+                username,
+                password,
+                totp,
+                uris,
+            } => {
+                for value in [username, password, totp] {
+                    decrypt(value.as_deref())?;
+                }
+                for uri in uris {
+                    decrypt(Some(&uri.uri))?;
+                }
+            }
+            rbw::db::EntryData::Card {
+                cardholder_name,
+                number,
+                brand,
+                exp_month,
+                exp_year,
+                code,
+            } => {
+                for value in [
+                    cardholder_name,
+                    number,
+                    brand,
+                    exp_month,
+                    exp_year,
+                    code,
+                ] {
+                    decrypt(value.as_deref())?;
+                }
+            }
+            rbw::db::EntryData::Identity {
+                title,
+                first_name,
+                middle_name,
+                last_name,
+                address1,
+                address2,
+                address3,
+                city,
+                state,
+                postal_code,
+                country,
+                phone,
+                email,
+                ssn,
+                license_number,
+                passport_number,
+                username,
+            } => {
+                for value in [
+                    title,
+                    first_name,
+                    middle_name,
+                    last_name,
+                    address1,
+                    address2,
+                    address3,
+                    city,
+                    state,
+                    postal_code,
+                    country,
+                    phone,
+                    email,
+                    ssn,
+                    license_number,
+                    passport_number,
+                    username,
+                ] {
+                    decrypt(value.as_deref())?;
+                }
+            }
+            rbw::db::EntryData::SecureNote => {}
+            rbw::db::EntryData::SshKey {
+                private_key,
+                public_key,
+                fingerprint,
+            } => {
+                for value in [private_key, public_key, fingerprint] {
+                    decrypt(value.as_deref())?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 

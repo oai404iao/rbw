@@ -12,9 +12,31 @@ pub async fn getpin(
     environment: &crate::protocol::Environment,
     grab: bool,
 ) -> Result<crate::locked::Password> {
+    run(pinentry, prompt, desc, err, environment, grab, b"GETPIN\n").await
+}
+
+pub async fn confirm(
+    pinentry: &str,
+    desc: &str,
+    environment: &crate::protocol::Environment,
+) -> Result<()> {
+    run(pinentry, "", desc, None, environment, true, b"CONFIRM\n").await?;
+    Ok(())
+}
+
+async fn run(
+    pinentry: &str,
+    prompt: &str,
+    desc: &str,
+    err: Option<&str>,
+    environment: &crate::protocol::Environment,
+    grab: bool,
+    command: &[u8],
+) -> Result<crate::locked::Password> {
     let mut opts = tokio::process::Command::new(pinentry);
     opts.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
     let mut args = vec!["--timeout".into(), "0".into()];
     if let Some(tty) = environment.tty() {
         args.extend(["--ttyname".into(), tty.into()]);
@@ -71,7 +93,7 @@ pub async fn getpin(
         ncommands += 1;
     }
     stdin
-        .write_all(b"GETPIN\n")
+        .write_all(command)
         .await
         .map_err(|source| Error::WriteStdin { source })?;
     ncommands += 1;
@@ -151,10 +173,8 @@ where
                     }
                 }
             } else {
-                return Err(Error::FailedToParsePinentry {
-                    out: String::from_utf8_lossy(data)
-                        .trim_end_matches('\0')
-                        .to_string(),
+                return Err(Error::PinentryErrorMessage {
+                    error: "unexpected pinentry response".to_string(),
                 });
             }
         } else {

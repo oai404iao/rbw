@@ -23,22 +23,60 @@ unchanged; a failed business retry does not discard a successful refresh.
 Rejected refresh tokens produce an authentication error without logging the
 identity response body or deleting the local vault.
 
-The on-disk database format and CLI remain unchanged. The Rust `actions` API
+The on-disk database format remains unchanged. The Rust `actions` API
 now manages stored authentication itself instead of accepting token snapshots
 and returning access-token updates. Database writers must hold `Db::lock` (or
 `lock_async`) across load/modify/save; `save_async` also retains the guard until
 its blocking write finishes, even if its caller is cancelled.
 
-An already expired refresh token still requires one re-authentication; this
-fix cannot renew an expired session. Plan switching packages and restarting
-the agent together: older agents do not participate in the new lock protocol.
-Installing a new binary alone does not update an already running agent.
+An expired or revoked refresh token requires a new login. From a terminal,
+explicitly opt in to recovery with:
+
+```sh
+rbw sync --reauth
+```
+
+Only a rejected refresh token triggers a confirmation dialog, followed by the
+existing master-password and supported two-factor authentication prompts.
+The agent keeps the current cache and unlocked keys while authenticating and
+validating a candidate vault. It atomically replaces the complete cache and
+installs the matching keys only after login, sync and decryption validation
+succeed. No agent restart or cache deletion is part of this recovery.
+Cancellation, incorrect credentials, unsupported 2FA, network failures and
+invalid candidate data leave the previous cache and keys in place. Normal
+autolock deadlines and remote logout notifications still apply.
+
+Ordinary `sync`, internal sync after mutations, timers, notifications and
+automatic key lookups do not initiate this recovery. A terminal alone is not
+consent: the flag and confirmation are both required. Non-terminal
+`sync --reauth` is rejected. Existing initial-login/unlock behavior is not
+changed. Concurrent recovery requests fail as busy instead of queuing more
+dialogs; a changed cache aborts the candidate commit rather than overwriting
+another writer. Closing the requesting CLI cancels recovery before commit
+and terminates its pending pinentry. Once atomic commit begins, disk and
+memory updates finish together even if the caller disconnects.
+
+Plan package installation and a manual agent switch in a maintenance window.
+The new CLI detects an incompatible old agent and reports an error without
+stopping it. Installing a new binary alone does not update a running agent.
+After arranging for interrupted key lookups, use `rbw stop-agent` and start
+the installed `rbw-agent`; stopping it clears in-memory unlock state and may
+interrupt applications using it. Do not mix an older client with the new
+agent: older clients may still stop agents on protocol mismatch. Use the
+new `sync --reauth` workflow instead of purging an expired local cache.
+
+Remote login effects cannot be rolled back if a request is interrupted.
+If replacement succeeds but the final directory fsync fails, the agent
+keeps matching new memory keys and reports that the commit happened but its
+durability could not be confirmed; it does not claim that the old cache was
+restored.
 
 Regression tests use isolated XDG directories and a loopback mock identity
 server with fictitious tokens:
 
 ```sh
 cargo test --locked --all-features --test refresh_rotation
+cargo test --locked --all-features --test reauthentication
 ```
 
 ## Maintenance

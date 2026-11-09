@@ -74,12 +74,11 @@ impl Agent {
                         let res =
                             handle_request(&mut sock, state.clone()).await;
                         if let Err(e) = res {
-                            // unwrap is the only option here
-                            sock.send(&rbw::protocol::Response::Error {
-                                error: format!("{e:#}"),
-                            })
-                            .await
-                            .unwrap();
+                            let _ = sock
+                                .send(&rbw::protocol::Response::Error {
+                                    error: format!("{e:#}"),
+                                })
+                                .await;
                         }
                     });
                 }
@@ -141,6 +140,15 @@ async fn handle_request(
         }
         rbw::protocol::Action::Sync => {
             crate::actions::sync(Some(sock), state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::SyncInteractive => {
+            crate::actions::sync_interactive(
+                sock,
+                state.clone(),
+                &environment,
+            )
+            .await?;
             false
         }
         rbw::protocol::Action::Decrypt {

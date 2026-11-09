@@ -6,11 +6,17 @@ pub enum Error {
     #[error("not logged in; authenticate with rbw login")]
     NotLoggedIn,
 
-    #[error("refresh token rejected; re-authentication is required")]
+    #[error("refresh token rejected; re-authentication required: run rbw sync --reauth in an interactive terminal")]
     RefreshTokenRejected,
 
     #[error("invalid token refresh response")]
     InvalidRefreshResponse,
+
+    #[error("invalid login response")]
+    InvalidLoginResponse,
+
+    #[error("invalid sync response")]
+    InvalidSyncResponse,
 
     #[error("failed to create block mode decryptor")]
     CreateBlockMode { source: aes::cipher::InvalidLength },
@@ -35,9 +41,6 @@ pub enum Error {
 
     #[error("failed to find free port in {range}")]
     FailedToFindFreePort { range: String },
-
-    #[error("failed to parse pinentry output ({out:?})")]
-    FailedToParsePinentry { out: String },
 
     #[error("failed to process sso callback ({msg})")]
     FailedToProcessSSOCallback { msg: String },
@@ -223,6 +226,12 @@ pub enum Error {
     #[error("failed to save db to {}", .file.display())]
     SaveDbAsync {
         source: tokio::io::Error,
+        file: std::path::PathBuf,
+    },
+
+    #[error("database replaced at {}, but directory durability could not be confirmed", .file.display())]
+    SaveDbCommitted {
+        source: std::io::Error,
         file: std::path::PathBuf,
     },
 

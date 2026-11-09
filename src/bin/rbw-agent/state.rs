@@ -1,6 +1,8 @@
 use sha2::Digest as _;
 
 pub struct State {
+    pub reauthentication: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub sync_update: std::sync::Arc<tokio::sync::Mutex<()>>,
     pub priv_key: Option<rbw::locked::Keys>,
     pub org_keys:
         Option<std::collections::HashMap<String, rbw::locked::Keys>>,

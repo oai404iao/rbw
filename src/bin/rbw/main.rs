@@ -49,7 +49,13 @@ enum Opt {
     Unlocked,
 
     #[command(about = "Update the local copy of the Bitwarden database")]
-    Sync,
+    Sync {
+        #[arg(
+            long,
+            help = "Allow confirmed re-authentication after a rejected refresh token (terminal required)"
+        )]
+        reauth: bool,
+    },
 
     #[command(
         about = "List all entries in the local Bitwarden database",
@@ -249,7 +255,7 @@ impl Opt {
             Self::Login => "login".to_string(),
             Self::Unlock => "unlock".to_string(),
             Self::Unlocked => "unlocked".to_string(),
-            Self::Sync => "sync".to_string(),
+            Self::Sync { .. } => "sync".to_string(),
             Self::List { .. } => "list".to_string(),
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
@@ -336,7 +342,7 @@ fn main() {
         Opt::Login => commands::login(),
         Opt::Unlock => commands::unlock(),
         Opt::Unlocked => commands::unlocked(),
-        Opt::Sync => commands::sync(),
+        Opt::Sync { reauth } => commands::sync(reauth),
         Opt::List { fields, raw } => commands::list(&fields, raw),
         Opt::Get {
             find_args,

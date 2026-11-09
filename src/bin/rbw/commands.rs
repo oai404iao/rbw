@@ -1350,7 +1350,15 @@ pub fn unlocked() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn sync() -> anyhow::Result<()> {
+pub fn sync(reauth: bool) -> anyhow::Result<()> {
+    if reauth {
+        use std::io::IsTerminal as _;
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("sync --reauth requires an interactive terminal");
+        }
+        ensure_agent()?;
+        return crate::actions::sync_interactive();
+    }
     ensure_agent()?;
     crate::actions::login()?;
     crate::actions::sync()?;
@@ -1895,8 +1903,21 @@ pub fn stop_agent() -> anyhow::Result<()> {
 
 fn ensure_agent() -> anyhow::Result<()> {
     check_config()?;
-    if matches!(check_agent_version(), Ok(())) {
-        return Ok(());
+    match check_agent_version() {
+        Ok(()) => return Ok(()),
+        Err(error) => {
+            let missing =
+                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::ConnectionRefused
+                    )
+                });
+            if !missing {
+                return Err(error);
+            }
+        }
     }
     run_agent()?;
     check_agent_version()?;
@@ -1933,20 +1954,13 @@ fn check_config() -> anyhow::Result<()> {
 
 fn check_agent_version() -> anyhow::Result<()> {
     let client_version = rbw::protocol::VERSION;
-    let agent_version = version_or_quit()?;
+    let agent_version = crate::actions::version()?;
     if agent_version != client_version {
-        crate::actions::quit()?;
         return Err(anyhow::anyhow!(
-            "client protocol version is {client_version} but agent protocol version is {agent_version}"
+            "client protocol version is {client_version} but agent protocol version is {agent_version}; switch rbw-agent manually in a maintenance window (this clears in-memory unlock state)"
         ));
     }
     Ok(())
-}
-
-fn version_or_quit() -> anyhow::Result<u32> {
-    crate::actions::version().inspect_err(|_| {
-        let _ = crate::actions::quit();
-    })
 }
 
 fn find_entry(

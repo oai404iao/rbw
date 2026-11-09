@@ -8,9 +8,7 @@ use rand::distr::SampleString as _;
 use sha2::Digest as _;
 use tokio::io::AsyncReadExt as _;
 
-use crate::json::{
-    DeserializeJsonWithPath as _, DeserializeJsonWithPathAsync as _,
-};
+use crate::json::DeserializeJsonWithPath as _;
 
 #[derive(
     serde_repr::Serialize_repr,
@@ -919,7 +917,13 @@ impl Client {
             .send()
             .await
             .map_err(|source| Error::Reqwest { source })?;
-        let prelogin_res: PreloginRes = res.json_with_path().await?;
+        if res.status() != reqwest::StatusCode::OK {
+            return Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            });
+        }
+        let prelogin_res: PreloginRes =
+            res.json().await.map_err(|_| Error::InvalidLoginResponse)?;
         Ok((
             prelogin_res.kdf,
             prelogin_res.kdf_iterations,
@@ -1048,7 +1052,14 @@ impl Client {
             .map_err(|source| Error::Reqwest { source })?;
 
         if res.status() == reqwest::StatusCode::OK {
-            let connect_res: ConnectTokenRes = res.json_with_path().await?;
+            let connect_res: ConnectTokenRes =
+                res.json().await.map_err(|_| Error::InvalidLoginResponse)?;
+            if connect_res.access_token.is_empty()
+                || connect_res.refresh_token.is_empty()
+                || connect_res.key.is_empty()
+            {
+                return Err(Error::InvalidLoginResponse);
+            }
             Ok((
                 connect_res.access_token,
                 connect_res.refresh_token,
@@ -1056,19 +1067,11 @@ impl Client {
             ))
         } else {
             let code = res.status().as_u16();
-            match res.text().await {
-                Ok(body) => match body.clone().json_with_path() {
-                    Ok(json) => Err(classify_login_error(&json, code)),
-                    Err(e) => {
-                        log::warn!("{e}: {body}");
-                        Err(Error::RequestFailed { status: code })
-                    }
-                },
-                Err(e) => {
-                    log::warn!("failed to read response body: {e}");
-                    Err(Error::RequestFailed { status: code })
-                }
-            }
+            let json = res
+                .json::<ConnectErrorRes>()
+                .await
+                .map_err(|_| Error::RequestFailed { status: code })?;
+            Err(classify_login_error(&json, code))
         }
     }
 
@@ -1101,7 +1104,6 @@ impl Client {
             Ok(())
         } else {
             let code = res.status().as_u16();
-            log::warn!("{code}: {:?}", res.text().await);
             Err(Error::RequestFailed { status: code })
         }
     }
@@ -1177,7 +1179,10 @@ impl Client {
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {
             reqwest::StatusCode::OK => {
-                let sync_res: SyncRes = res.json_with_path().await?;
+                let sync_res: SyncRes = res
+                    .json()
+                    .await
+                    .map_err(|_| Error::InvalidSyncResponse)?;
                 let folders = sync_res.folders.clone();
                 let ciphers = sync_res
                     .ciphers
@@ -1759,10 +1764,9 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
     match error_res.error.as_str() {
         "invalid_grant" => match error_desc {
             Some("invalid_username_or_password") => {
-                if let Some(error_model) = error_res.error_model.as_ref() {
-                    let message = error_model.message.as_str().to_string();
-                    return Error::IncorrectPassword { message };
-                }
+                return Error::IncorrectPassword {
+                    message: "Password or verification code is incorrect. Try again.".to_string(),
+                };
             }
             Some("Two factor required.") => {
                 if let Some(providers) =
@@ -1799,7 +1803,9 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
                             if s.starts_with(
                                 "Invalid TOTP code! Server time: ",
                             ) {
-                                return Error::IncorrectPassword { message };
+                                return Error::IncorrectPassword {
+                                    message: "Verification code is incorrect. Try again.".to_string(),
+                                };
                             }
                         }
                     }
@@ -1809,6 +1815,5 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
         _ => {}
     }
 
-    log::warn!("unexpected error received during login: {error_res:?}");
     Error::RequestFailed { status: code }
 }

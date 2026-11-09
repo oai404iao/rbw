@@ -267,7 +267,6 @@ impl Db {
                 file: file.clone(),
             })?;
         save_bytes(&file, &json)
-            .map_err(|source| Error::SaveDb { source, file })
     }
 
     pub async fn save_async(
@@ -299,7 +298,6 @@ impl Db {
             source: std::io::Error::other(source),
             file: file.clone(),
         })?
-        .map_err(|source| Error::SaveDbAsync { source, file })
     }
 
     pub fn remove(server: &str, email: &str) -> Result<()> {
@@ -340,17 +338,29 @@ fn lock_file(file: &std::path::Path) -> std::io::Result<std::fs::File> {
     Ok(guard)
 }
 
-fn save_bytes(file: &std::path::Path, json: &[u8]) -> std::io::Result<()> {
+fn save_bytes(file: &std::path::Path, json: &[u8]) -> Result<()> {
     // Database paths always include their containing directory.
     let directory = file.parent().unwrap();
-    std::fs::create_dir_all(directory)?;
-    // NamedTempFile creates the file with mode 0600 on Unix.
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(json)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(file).map_err(|error| error.error)?;
-    std::fs::File::open(directory)?.sync_all()?;
+    (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(directory)?;
+        // NamedTempFile creates the file with mode 0600 on Unix.
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        temporary.write_all(json)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(file).map_err(|error| error.error)?;
+        Ok(())
+    })()
+    .map_err(|source| Error::SaveDb {
+        source,
+        file: file.to_owned(),
+    })?;
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| Error::SaveDbCommitted {
+            source,
+            file: file.to_owned(),
+        })?;
     Ok(())
 }
 

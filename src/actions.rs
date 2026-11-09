@@ -101,7 +101,14 @@ pub fn unlock<S: std::hash::BuildHasher>(
     let protected_key =
         crate::cipherstring::CipherString::new(protected_key)?;
     let key = match protected_key.decrypt_locked_symmetric(&identity.keys) {
-        Ok(master_keys) => crate::locked::Keys::new(master_keys),
+        Ok(master_keys) => {
+            if master_keys.data().len() < 64 {
+                return Err(Error::InvalidCipherString {
+                    reason: "decrypted master key is too short".to_string(),
+                });
+            }
+            crate::locked::Keys::new(master_keys)
+        }
         Err(Error::InvalidMac) => {
             return Err(Error::IncorrectPassword {
                 message: "Password is incorrect. Try again.".to_string(),
@@ -124,7 +131,15 @@ pub fn unlock<S: std::hash::BuildHasher>(
             crate::cipherstring::CipherString::new(protected_org_key)?;
         let org_key =
             match protected_org_key.decrypt_locked_asymmetric(&private_key) {
-                Ok(org_key) => crate::locked::Keys::new(org_key),
+                Ok(org_key) => {
+                    if org_key.data().len() < 64 {
+                        return Err(Error::InvalidCipherString {
+                            reason: "decrypted organization key is too short"
+                                .to_string(),
+                        });
+                    }
+                    crate::locked::Keys::new(org_key)
+                }
                 Err(e) => return Err(e),
             };
         org_keys.insert(org_id.clone(), org_key);

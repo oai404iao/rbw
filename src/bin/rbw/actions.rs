@@ -48,6 +48,10 @@ pub fn sync() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Sync)
 }
 
+pub fn sync_interactive() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::SyncInteractive)
+}
+
 pub fn lock() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Lock)
 }

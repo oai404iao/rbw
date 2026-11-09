@@ -8,6 +8,18 @@ impl Sock {
         Self(s)
     }
 
+    pub async fn disconnected(&self) -> std::io::Result<()> {
+        loop {
+            self.0.readable().await?;
+            match self.0.try_read(&mut [0; 1]) {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub async fn send(
         &mut self,
         res: &rbw::protocol::Response,

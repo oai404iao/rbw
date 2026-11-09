@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+* `sync --reauth` explicitly offers confirmed terminal-only recovery after a
+  rejected refresh token, keeping the previous vault and keys until a complete
+  candidate login, sync and decryption validation succeeds.
+
 ### Fixed
 
 * Persist replacement refresh tokens before retrying authenticated requests,
@@ -10,6 +16,10 @@
 * Serialize authentication and database writes across processes, atomically
   replace private database files, and prevent sync from restoring stale tokens.
 * Report rejected or malformed refresh responses without exposing their body.
+* Reject incompatible running agents without automatically stopping them.
+* Serialize sync results against reauthentication commits and arm autolock
+  when recovery installs new keys. Cancel pending recovery prompts when the
+  requesting CLI disconnects before commit.
 
 ## [1.15.0] - 2025-12-31
 
